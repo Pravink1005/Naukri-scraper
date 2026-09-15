@@ -1,0 +1,5 @@
+.naukri_profile/
+.venv/
+__pycache__/
+*.csv
+*.html
