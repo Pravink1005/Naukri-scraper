@@ -23,6 +23,7 @@ import re
 import json
 import argparse
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit, urlunsplit
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 USER_AGENT = (
@@ -30,15 +31,40 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 )
 
-# Base search URL - jobAge=1 means "posted in last 1 day"
-DEFAULT_SEARCH_URL = "https://www.naukri.com/data-analyst-jobs?jobAge=1"
-DEFAULT_SEARCH_URLS = [
-    DEFAULT_SEARCH_URL,
-    "https://www.naukri.com/business-analyst-jobs?jobAge=1",
-    "https://www.naukri.com/data-engineer-jobs?jobAge=1",
-    "https://www.naukri.com/data-scientist-jobs?jobAge=1",
-    "https://www.naukri.com/power-bi-jobs?jobAge=1",
+# ============================================================
+# EDIT THIS LIST TO CHANGE WHICH JOB TITLES ARE SEARCHED.
+# Just type full job titles, one per entry — no codes needed.
+# Example: ["data analyst", "data engineer", "business analyst"]
+# ============================================================
+SEARCH_JOB_TITLES = [
+    "data analyst",
 ]
+
+
+def slugify_title(title):
+    """
+    Turn one job title into a Naukri URL slug.
+    e.g. "Data Analyst" -> "data-analyst", "Sr. ML Engineer" -> "sr-ml-engineer".
+    """
+    title = (title or "").strip()
+    if not title:
+        return None
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return slug or None
+
+
+def build_search_urls_from_titles(titles):
+    """Turn a list (or comma-separated string) of full job titles into jobAge=1 search URLs."""
+    if isinstance(titles, str):
+        titles = titles.split(",")
+    urls = []
+    for raw in titles:
+        slug = slugify_title(raw)
+        if not slug:
+            print(f"    [!] Skipping empty title: {raw!r}")
+            continue
+        urls.append(f"https://www.naukri.com/{slug}-jobs?jobAge=1")
+    return urls
 OUTPUT_FIELDS = [
     "url", "title", "company", "location", "experience", "salary",
     "skills", "qualifications_education_required", "job_description_summary",
@@ -229,13 +255,28 @@ def clean_skills(values):
     return "; ".join(cleaned) or "Not specified"
 
 
+def build_page_url(search_url, page_num):
+    """
+    Build the URL for page N of a Naukri search.
+    Naukri does NOT paginate via a query string like '&page=2' — it appends
+    the page number directly onto the URL path, e.g.:
+        https://www.naukri.com/data-analyst-jobs?jobAge=1        (page 1)
+        https://www.naukri.com/data-analyst-jobs-2?jobAge=1      (page 2)
+    Using '&page=2' instead just gets ignored (or served as page 1 again),
+    which is why pagination silently returned 0 new links.
+    """
+    if page_num <= 1:
+        return search_url
+    parts = urlsplit(search_url)
+    return urlunsplit((parts.scheme, parts.netloc, f"{parts.path}-{page_num}", parts.query, parts.fragment))
+
+
 def get_job_links(page, search_url, max_pages=10, max_jobs=100, delay=2, interactive=False):
     """Collect unique job detail page links from search result pages."""
     job_links = []
 
     for page_num in range(1, max_pages + 1):
-        sep = "&" if "?" in search_url else "?"
-        url = f"{search_url}{sep}page={page_num}" if page_num > 1 else search_url
+        url = build_page_url(search_url, page_num)
 
         print(f"[+] Loading search page {page_num}: {url}")
         try:
@@ -374,6 +415,7 @@ def save_to_csv(jobs, output_file):
 def main():
     parser = argparse.ArgumentParser(description="Scrape Naukri data analyst jobs (last N days)")
     parser.add_argument("--url", action="append", dest="urls", help="Naukri search URL; repeat for multiple searches")
+    parser.add_argument("--titles", default=None, help="Optional: comma-separated full job titles to override SEARCH_JOB_TITLES in the code, e.g. 'data analyst,data engineer'")
     parser.add_argument("--pages", type=int, default=5, help="Max search result pages to crawl PER search URL")
     parser.add_argument("--max-jobs", type=int, default=100, help="Maximum job LINKS to collect PER search URL (not shared across searches)")
     parser.add_argument("--max-total", type=int, default=None, help="Optional cap on total scraped postings across ALL searches combined (default: no cap)")
@@ -385,7 +427,18 @@ def main():
     parser.add_argument("--browser", choices=["chromium", "firefox"], default="chromium", help="Which browser engine to use")
     args = parser.parse_args()
     headless = args.headless
-    search_urls = args.urls or DEFAULT_SEARCH_URLS
+    if args.urls:
+        search_urls = args.urls
+    elif args.titles:
+        search_urls = build_search_urls_from_titles(args.titles)
+    else:
+        # Default: build searches from the SEARCH_JOB_TITLES list defined
+        # near the top of this file — edit that list directly in the code.
+        search_urls = build_search_urls_from_titles(SEARCH_JOB_TITLES)
+
+    if not search_urls:
+        print("No valid search URLs resolved. Edit SEARCH_JOB_TITLES near the top of the file. Exiting.")
+        return
 
     all_jobs = []
     seen_jobs = set()
